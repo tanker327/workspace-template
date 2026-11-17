@@ -121,6 +121,16 @@ refute "beta is not cloned yet"            test -e "$WS/repos/beta"
 check  "list shows beta as missing"        out_has "missing" ws list
 refute "adding a duplicate fails"          ws add alpha "$TMP/remotes/alpha.git"
 refute "invalid name is rejected"          ws add "bad.name" "$TMP/remotes/alpha.git"
+refute "a path outside repos/ is rejected" ws add delta "$TMP/remotes/alpha.git" --path apps/delta
+refute "an absolute path is rejected"      ws add delta "$TMP/remotes/alpha.git" --path "$TMP/abs/delta"
+refute "a path with .. is rejected"        ws add delta "$TMP/remotes/alpha.git" --path repos/../delta
+refute "a rejected path records nothing"   has "$WS/repos.conf" '[repo "delta"]'
+check  "a path under repos/ is accepted"   ws add delta "$TMP/remotes/alpha.git" --path repos/group/delta --no-clone
+check  "path honors the custom location"   test "$(ws path delta)" = "$WS/repos/group/delta"
+ws remove delta >/dev/null 2>&1
+refute "add fails when the clone fails"    ws add ghost "$TMP/remotes/no-such-repo.git"
+refute "a failed add leaves nothing in the manifest" has "$WS/repos.conf" '[repo "ghost"]'
+refute "a failed add leaves nothing in the index" has "$WS/CLAUDE.md" '**ghost**'
 check  "clone fetches the missing repo"    ws clone
 check  "beta is cloned now"                test -d "$WS/repos/beta/.git"
 check  "clone is idempotent"               ws clone
@@ -156,6 +166,29 @@ check  "status reports uncommitted changes" out_has "1 changed" ws status
 git -C "$WS/repos/alpha" commit -q -am "local commit"
 check  "status reports unpushed commits"   out_has "ahead 1, behind 0" ws status
 git -C "$WS/repos/alpha" push -q
+
+# Work that is not on the checked-out branch of the main checkout.
+git -C "$WS/repos/alpha" checkout -q -b side
+echo "side edit" >> "$WS/repos/alpha/file.txt"
+git -C "$WS/repos/alpha" commit -q -am "side commit"
+git -C "$WS/repos/alpha" checkout -q main
+check  "status reports an unpushed commit on another branch" \
+  out_has "branch side: 1 commit(s) not on any remote" ws status
+# 2: alpha, plus the workspace repo itself, which has no upstream yet.
+check  "status counts that repo as unpushed" out_has "2 with unpushed commits" ws status
+git -C "$WS/repos/alpha" push -q origin side
+refute "a pushed branch is no longer reported" out_has "branch side" ws status
+echo "stashed edit" >> "$WS/repos/alpha/file.txt"
+git -C "$WS/repos/alpha" stash -q
+check  "status reports a stash"            out_has "stashes: 1" ws status
+git -C "$WS/repos/alpha" stash drop -q
+git -C "$WS/repos/alpha" worktree add -q ../alpha--task -b task
+echo "worktree edit" >> "$WS/repos/alpha--task/file.txt"
+check  "status reports a dirty linked worktree" \
+  out_has "worktree repos/alpha--task (task): 1 changed" ws status
+git -C "$WS/repos/alpha" worktree remove --force ../alpha--task
+git -C "$WS/repos/alpha" branch -q -D task
+refute "a clean repo has no extra lines"   out_has "  + " ws status
 
 # Someone else pushes to beta.
 git clone -q "$TMP/remotes/beta.git" "$TMP/other-beta"
@@ -242,6 +275,19 @@ check  "doctor warns about an @import in CLAUDE.md" out_has "contains an @import
 git -C "$WS" checkout -q -- CLAUDE.md 2>/dev/null || true
 ws index >/dev/null 2>&1
 
+check  "index --check passes when the index is current" ws index --check
+git config -f "$WS/repos.conf" repo.alpha.desc "Edited by hand"
+refute "index --check fails after a hand edit of repos.conf" ws index --check
+check  "doctor warns about a stale index"  out_has "repo index in CLAUDE.md is out of date" ws doctor
+check  "index --check did not rewrite CLAUDE.md" has "$WS/CLAUDE.md" ': Alpha service _[svc,core]_'
+git config -f "$WS/repos.conf" repo.alpha.desc "Alpha service"
+check  "the index is current again"        ws index --check
+refute "no stale-index warning when it is current" out_has "is out of date" ws doctor
+git config -f "$WS/repos.conf" repo.stray.url "$TMP/remotes/alpha.git"
+git config -f "$WS/repos.conf" repo.stray.path apps/stray
+check  "doctor warns about a path outside repos/" out_has "is not a relative path under repos/" ws doctor
+git config -f "$WS/repos.conf" --remove-section repo.stray
+
 refute "no absolute-path warning for the shipped files" out_has "absolute home paths" ws doctor
 mkdir -p "$WS/shared/skills/abs"
 printf 'run /Users/someone/workspace/bin/ws\n' > "$WS/shared/skills/abs/SKILL.md"
@@ -255,6 +301,15 @@ check  "doctor warns when the workspace is inside another repo" out_has "inside 
 rm -rf "$TMP/machineA/.git"
 refute "no location warnings in a normal location" \
   sh -c "'$WS/bin/ws' doctor 2>&1 | grep -Eq 'above the workspace|inside another git repo|cloud-synced'"
+
+# ----------------------------------------------------------------- docs ----
+
+echo "docs"
+MISSING=""
+for c in $(ws help | sed -n 's/^  ws \([a-z]*\).*/\1/p' | sort -u); do
+  grep -qF "\`ws $c" "$WS/docs/09-ws-reference.md" || MISSING="$MISSING $c"
+done
+check  "every command in ws help is in docs/09-ws-reference.md:$MISSING" test -z "$MISSING"
 
 # ------------------------------------------------- invoked via a symlink ----
 

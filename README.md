@@ -73,5 +73,5 @@ command. See `docs/10-shared-skills-and-agents.md`.
 ## Status
 
 This is a pilot. `docs/08-pilot-checklist.md` lists what to verify before adding
-more repos. `ws` was tested on Linux with bash 5; run `tests/smoke.sh` once on
-macOS to confirm it behaves the same there.
+more repos, and records under P1 where `tests/smoke.sh` has been run. Run it
+once on each new kind of machine.

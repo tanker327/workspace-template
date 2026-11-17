@@ -30,7 +30,7 @@ the file.
 | `url` | Yes | Clone URL. Any form `git clone` accepts |
 | `tags` | No | Comma-separated labels. Used by `--tag` in `ws list`, `clone`, `status`, `pull`, `grep`, `exec` |
 | `desc` | No | One line describing the repo. Shown to agents in the `CLAUDE.md` repo index. Say what it does and how it relates to other repos |
-| `path` | No | Clone location relative to the workspace root. Default `repos/<name>`. An absolute path also works |
+| `path` | No | Clone location, as a relative path under `repos/`, such as `repos/group/<name>`. Default `repos/<name>`. `ws add` rejects anything else, and `ws doctor` warns about a hand-edited one: a clone outside `repos/` is not ignored by the workspace repo, and an absolute path differs between machines |
 
 A repo exists in the manifest when it has a `url`.
 
@@ -61,6 +61,9 @@ git config -f repos.conf repo.orders-api.tags shop,service,core
 git config -f repos.conf repo.orders-api.desc "New description"
 ws index
 ```
+
+If you forget `ws index`, `ws doctor` and `ws index --check` report that the
+list in `CLAUDE.md` is out of date.
 
 ## Reading the manifest
 

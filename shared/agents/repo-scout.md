@@ -11,7 +11,9 @@ files.
 
 1. Locate the repo. Run `ws path <name>`. If `ws` is not on PATH, walk up from
    the current directory to the one containing `repos.conf` and use
-   `<root>/bin/ws`. If the repo is not cloned, say so and stop.
+   `<root>/bin/ws`. If the repo is not cloned, say so and stop. If there is
+   no `ws` and no `repos.conf` above, or `ws path` does not know the name, the
+   repo is not part of the workspace: say so and stop. Do not search the disk.
 2. Read the repo's `CLAUDE.md` or `AGENTS.md` and `README.md` to learn its layout.
 3. Search inside that repo's path only. Prefer `git -C <path> grep -n <pattern>`
    or a search tool pointed at that path. Do not search from the workspace root:

@@ -95,16 +95,8 @@ ws link
 git add shared && git commit -m "Add <name> skill" && git push
 ```
 
-In symlink mode an edit to an existing skill or agent is live as soon as the
-file is saved. `ws link` is needed only for a new or deleted one. In copy mode
-run `ws link` after every edit. Claude Code may need a restart to notice a
-newly added skill directory or agent.
-
-Deleting a skill or agent from `shared/` and running `ws link` removes its
-link. Other machines pick up all of this on `ws sync`.
-
-Never create or edit these under `~/.claude` directly. The full table of what
-each operation requires, plus troubleshooting, is in
+Edit under `shared/`, never under `~/.claude`. What each operation requires
+(create, update, delete, rename, copy mode) and troubleshooting are in
 `10-shared-skills-and-agents.md`.
 
 ## W8. Parallel work on the same repo
@@ -118,9 +110,13 @@ git -C repos/orders-api worktree remove ../orders-api--fix-queue    # when done
 ```
 
 A worktree placed next to its repo under `repos/` is ignored by the workspace
-repo and is not in the manifest, so `ws` leaves it alone. Claude Code and
-Herdr also have their own worktree features. Any of them is fine, because the
-worktree always belongs to the project repo and never to the workspace.
+repo and is not in the manifest. Claude Code and Herdr also have their own
+worktree features. Any of them is fine, because the worktree always belongs to
+the project repo and never to the workspace.
+
+`ws status` shows worktree work under the row of the repo it belongs to: a
+linked worktree with uncommitted changes, and any branch with commits that are
+on no remote. `ws grep`, `ws pull` and `ws exec` use the main checkout only.
 
 ## W9. Remove a repo
 

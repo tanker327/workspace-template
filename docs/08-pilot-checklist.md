@@ -13,7 +13,7 @@ Claude Code version tested: `2.1.326`  Date: `2026-11-16`
 
 | ID | Check | Steps | Expected | Result |
 |---|---|---|---|---|
-| P1 | `ws` works on this OS | `tests/smoke.sh` on macOS, and on Linux if used | All checks pass | Pass on macOS (Darwin 27.2.0, bash 3.2.57, git 2.54.0): 90 passed, 0 failed. Linux not run yet |
+| P1 | `ws` works on this OS | `tests/smoke.sh` on macOS, and on Linux if used | All checks pass | macOS: pass on 2026-11-17 (Darwin 27.2.0, bash 3.2.57, git 2.54.0), all 113 checks. Linux: pass on 2026-11-17 in an Ubuntu 24.04 container (arm64, bash 5.2.21, git 2.43.0), all 113 checks. Not yet run on a real Linux machine |
 | P2 | Bootstrap completes | `./bootstrap.sh`, then `ws doctor` | 0 failures. Every warning understood | |
 
 ## Context loading checks

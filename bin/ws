@@ -83,6 +83,21 @@ valid_name() {
   esac
 }
 
+valid_path() {
+  # A clone must sit under repos/. That keeps it inside the workspace, so
+  # the workspace CLAUDE.md loads there, and ignored by the workspace repo,
+  # so it cannot be committed into it. No absolute paths: they differ
+  # between machines and would end up in the tracked CLAUDE.md index.
+  case "$1" in
+    repos/?*) ;;
+    *) return 1 ;;
+  esac
+  case "/$1/" in
+    */../*|*/./*|*//*) return 1 ;;
+  esac
+  return 0
+}
+
 repo_names() {
   [ -f "$MANIFEST" ] || return 0
   cfg --name-only --get-regexp '^repo\..*\.url$' 2>/dev/null \
@@ -225,10 +240,14 @@ cmd_add() {
     esac
   done
   [ -n "$name" ] && [ -n "$url" ] \
-    || die "usage: ws add <name> <git-url> [--tags a,b] [--desc \"text\"] [--path dir] [--no-clone]"
+    || die "usage: ws add <name> <git-url> [--tags a,b] [--desc \"text\"] [--path repos/dir] [--no-clone]"
   valid_name "$name" \
     || die "invalid name '$name': use letters, digits, '-' and '_' only"
   repo_exists "$name" && die "repo '$name' is already in $(basename "$MANIFEST")"
+  if [ -n "$path" ]; then
+    valid_path "$path" \
+      || die "invalid --path '$path': it must be a relative path under repos/, such as repos/group/$name"
+  fi
 
   cfg "repo.$name.url" "$url" || die "could not write $(basename "$MANIFEST")"
   [ -z "$path" ] || cfg "repo.$name.path" "$path"
@@ -238,7 +257,14 @@ cmd_add() {
 
   cmd_index
   if [ "$do_clone" -eq 1 ]; then
-    cmd_clone "$name" || return 1
+    if ! cmd_clone "$name"; then
+      # Do not leave a repo that was never cloned in the manifest and in
+      # the CLAUDE.md index.
+      cfg --remove-section "repo.$name" 2>/dev/null
+      cmd_index >/dev/null
+      err "$name was not added. Fix the problem and run ws add again, or pass --no-clone to record it without cloning"
+      return 1
+    fi
   fi
   info "Commit the manifest change: git -C \"$ROOT\" add repos.conf CLAUDE.md && git -C \"$ROOT\" commit -m \"Add $name\""
 }
@@ -256,27 +282,63 @@ cmd_remove() {
   fi
 }
 
-# Rewrite the repo index block in CLAUDE.md from repos.conf, so agents see
-# the list of repos without running a command and the two never drift.
-cmd_index() {
-  local block tmp name desc tags line
-  [ -f "$INDEX_FILE" ] || { warn "no CLAUDE.md at workspace root; skipping index"; return 0; }
-  if ! grep -qF "$INDEX_START" "$INDEX_FILE" || ! grep -qF "$INDEX_END" "$INDEX_FILE"; then
-    warn "CLAUDE.md has no '$INDEX_START' / '$INDEX_END' markers; skipping index"
-    return 0
-  fi
-  block="$ROOT/.ws-index.tmp"
-  tmp="$ROOT/.ws-claude.tmp"
-  : > "$block"
+# The repo index block for CLAUDE.md, generated from repos.conf.
+index_block() {
+  local name desc tags line any=0
   for name in $(repo_names); do
     desc="$(repo_get "$name" desc)"
     tags="$(repo_get "$name" tags)"
     line="- **$name** (\`$(repo_rel "$name")\`)"
     [ -z "$desc" ] || line="$line: $desc"
     [ -z "$tags" ] || line="$line _[${tags}]_"
-    printf '%s\n' "$line" >> "$block"
+    printf '%s\n' "$line"
+    any=1
   done
-  [ -s "$block" ] || printf '%s\n' "_No repos yet. Add one with \`ws add <name> <git-url>\`._" > "$block"
+  [ "$any" -eq 1 ] || printf '%s\n' "_No repos yet. Add one with \`ws add <name> <git-url>\`._"
+}
+
+# The repo index block as it is in CLAUDE.md now.
+index_current() {
+  awk -v start="$INDEX_START" -v end="$INDEX_END" '
+    index($0, end) { inside = 0 }
+    inside { print }
+    index($0, start) { inside = 1 }
+  ' "$INDEX_FILE"
+}
+
+index_has_markers() {
+  [ -f "$INDEX_FILE" ] && grep -qF "$INDEX_START" "$INDEX_FILE" && grep -qF "$INDEX_END" "$INDEX_FILE"
+}
+
+index_is_current() { [ "$(index_block)" = "$(index_current)" ]; }
+
+# Rewrite the repo index block in CLAUDE.md from repos.conf, so agents see
+# the list of repos without running a command. With --check, change nothing
+# and exit 1 when the block no longer matches repos.conf.
+cmd_index() {
+  local block tmp check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; shift ;;
+      *) die "index: unknown argument: $1" ;;
+    esac
+  done
+  [ -f "$INDEX_FILE" ] || { warn "no CLAUDE.md at workspace root; skipping index"; return 0; }
+  if ! index_has_markers; then
+    warn "CLAUDE.md has no '$INDEX_START' / '$INDEX_END' markers; skipping index"
+    return 0
+  fi
+  if [ "$check" -eq 1 ]; then
+    if index_is_current; then
+      ok "repo index in CLAUDE.md matches repos.conf"
+      return 0
+    fi
+    err "repo index in CLAUDE.md is out of date (run: ws index)"
+    return 1
+  fi
+  block="$ROOT/.ws-index.tmp"
+  tmp="$ROOT/.ws-claude.tmp"
+  index_block > "$block"
 
   awk -v start="$INDEX_START" -v end="$INDEX_END" -v block="$block" '
     index($0, start) {
@@ -293,9 +355,41 @@ cmd_index() {
   info "repo index in CLAUDE.md is up to date"
 }
 
+# Work in a repo that its status row does not show: other local branches
+# with commits that are on no remote, stashes, and linked worktrees with
+# uncommitted changes. Prints one line per finding, tagged U (unpushed) or
+# D (uncommitted). Args: path, current branch
+status_extras() {
+  local p="$1" cur="$2" b n top wt
+  git -C "$p" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null \
+    | while IFS= read -r b; do
+        [ "$b" = "$cur" ] && continue
+        n="$(git -C "$p" rev-list --count "refs/heads/$b" --not --remotes 2>/dev/null)"
+        [ -n "$n" ] || continue
+        [ "$n" -eq 0 ] || say "U branch $b: $n commit(s) not on any remote"
+      done
+  n="$(git -C "$p" stash list 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$n" -eq 0 ] || say "D stashes: $n"
+  top="$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)"
+  git -C "$p" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' \
+    | while IFS= read -r wt; do
+        [ "$wt" = "$top" ] && continue
+        [ -d "$wt" ] || continue
+        n="$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+        [ "$n" -eq 0 ] && continue
+        b="$(git -C "$wt" symbolic-ref --short -q HEAD 2>/dev/null)"
+        [ -n "$b" ] || b="detached"
+        case "$wt" in
+          "$ROOT"/*) wt="${wt#"$ROOT"/}" ;;
+        esac
+        say "D worktree $wt ($b): $n changed"
+      done
+}
+
 # One status row. Args: label, path
 status_row() {
-  local label="$1" p="$2" branch dirty sync counts behind ahead
+  local label="$1" p="$2" branch dirty sync counts behind ahead extras
+  local is_dirty=0 is_unpushed=0
   if [ ! -e "$p/.git" ]; then
     printf '%-20s %s\n' "$label" "${C_YEL}missing${C_OFF} (run: ws clone $label)"
     N_MISSING=$((N_MISSING + 1))
@@ -307,7 +401,7 @@ status_row() {
   counts="$(git -C "$p" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null)"
   if [ -z "$counts" ]; then
     sync="no upstream"
-    N_UNPUSHED=$((N_UNPUSHED + 1))
+    is_unpushed=1
   else
     # shellcheck disable=SC2086
     set -- $counts
@@ -317,11 +411,19 @@ status_row() {
     else
       sync="ahead $ahead, behind $behind"
     fi
-    [ "$ahead" -eq 0 ] || N_UNPUSHED=$((N_UNPUSHED + 1))
+    [ "$ahead" -eq 0 ] || is_unpushed=1
   fi
-  [ "$dirty" -eq 0 ] || N_DIRTY=$((N_DIRTY + 1))
+  [ "$dirty" -eq 0 ] || is_dirty=1
   if [ "$dirty" -eq 0 ]; then dirty="clean"; else dirty="$dirty changed"; fi
   printf '%-20s %-22s %-12s %s\n' "$label" "$branch" "$dirty" "$sync"
+  extras="$(status_extras "$p" "$branch")"
+  if [ -n "$extras" ]; then
+    printf '%s\n' "$extras" | sed -e 's/^[UD] /  + /'
+    if printf '%s\n' "$extras" | grep -q '^U '; then is_unpushed=1; fi
+    if printf '%s\n' "$extras" | grep -q '^D '; then is_dirty=1; fi
+  fi
+  N_DIRTY=$((N_DIRTY + is_dirty))
+  N_UNPUSHED=$((N_UNPUSHED + is_unpushed))
 }
 
 cmd_status() {
@@ -333,7 +435,7 @@ cmd_status() {
     esac
   done
   N_MISSING=0; N_DIRTY=0; N_UNPUSHED=0
-  printf "${C_BLD}%-20s %-22s %-12s %s${C_OFF}\n" "REPO" "BRANCH" "WORKTREE" "REMOTE"
+  printf "${C_BLD}%-20s %-22s %-12s %s${C_OFF}\n" "REPO" "BRANCH" "CHANGES" "REMOTE"
   if [ -e "$ROOT/.git" ]; then
     status_row "(workspace)" "$ROOT"
   else
@@ -344,7 +446,7 @@ cmd_status() {
     total=$((total + 1))
   done
   say ""
-  say "$total project repo(s). Counting the workspace repo too: $N_DIRTY with uncommitted changes, $N_UNPUSHED with unpushed commits or no upstream, $N_MISSING not cloned"
+  say "$total project repo(s). Counting the workspace repo too: $N_DIRTY with uncommitted changes or stashes, $N_UNPUSHED with unpushed commits or no upstream, $N_MISSING not cloned"
   if [ $((N_DIRTY + N_UNPUSHED)) -gt 0 ]; then
     info "Work that is not pushed will not be on your other machines."
   fi
@@ -583,7 +685,7 @@ cmd_unlink() {
 # --------------------------------------------------------------- doctor ----
 
 cmd_doctor() {
-  local fails=0 warns=0 name p url actual lines n item dest parent dir f hits both_setting=0
+  local fails=0 warns=0 name p rel url actual lines n item dest parent dir f hits both_setting=0
   d_ok()   { ok "$*"; }
   d_warn() { warn "$*"; warns=$((warns + 1)); }
   d_fail() { err "$*"; fails=$((fails + 1)); }
@@ -645,6 +747,9 @@ cmd_doctor() {
     if sed -e '/^```/,/^```/d' "$INDEX_FILE" | grep -Eq '(^|[[:space:]])@[A-Za-z0-9_~./-]+\.(md|txt)'; then
       d_warn "CLAUDE.md contains an @import. From a child repo that is an external import and needs approval in each repo. Use a plain path in backticks instead"
     fi
+    if index_has_markers && ! index_is_current; then
+      d_warn "the repo index in CLAUDE.md is out of date with repos.conf (run: ws index)"
+    fi
   else
     d_fail "CLAUDE.md is missing at the workspace root"
   fi
@@ -668,6 +773,10 @@ cmd_doctor() {
     if ! valid_name "$name"; then
       d_fail "$name: invalid name in repos.conf (letters, digits, '-', '_' only)"
       continue
+    fi
+    rel="$(repo_get "$name" path)"
+    if [ -n "$rel" ] && ! valid_path "$rel"; then
+      d_warn "$name: path '$rel' is not a relative path under repos/. The workspace repo does not ignore it, and an absolute path differs between machines"
     fi
     if ! is_cloned "$name"; then
       d_warn "$name: not cloned (run: ws clone $name)"
@@ -775,14 +884,16 @@ Setup
 
 Repos (the list lives in repos.conf)
   ws list [--tag t]            Show repos, tags and whether each is cloned
-  ws add <name> <url> [--tags a,b] [--desc "text"] [--path dir] [--no-clone]
+  ws add <name> <url> [--tags a,b] [--desc "text"] [--path repos/dir] [--no-clone]
   ws remove <name>             Remove from repos.conf (the clone stays on disk)
   ws clone [--tag t] [name..]  Clone repos that are missing
   ws path <name>               Print the absolute path of a repo
-  ws index                     Rewrite the repo list inside CLAUDE.md from repos.conf
+  ws index [--check]           Rewrite the repo list inside CLAUDE.md from repos.conf
+                               --check changes nothing and fails when it is out of date
 
 Across repos
-  ws status [--tag t]          Branch, uncommitted changes and unpushed commits per repo
+  ws status [--tag t]          Uncommitted and unpushed work per repo, including other
+                               branches, stashes and linked worktrees
   ws pull [--tag t]            Fast-forward every clean repo
   ws grep [--tag t] <pattern>  Search all repos (accepts git grep options)
   ws exec [--tag t] -- <cmd>   Run a command inside every repo

@@ -14,6 +14,13 @@ started inside `repos/<name>`, the workspace root is two levels up.
 Use `ws` if it is on PATH. Otherwise walk up from the current directory until
 you find a directory that contains `repos.conf`, and call `<root>/bin/ws`.
 
+If `ws` is not on PATH and no directory above contains `repos.conf`, there is
+no workspace to use and this skill does not apply. Say so and carry on without
+it. Do not search the disk for a workspace.
+
+This skill is installed for every session on the machine, so the current repo
+may not be one of the workspace's repos. `ws list` shows which repos are.
+
 ## Find a repo
 
 ```bash

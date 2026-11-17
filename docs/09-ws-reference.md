@@ -12,24 +12,25 @@ through a symlink on PATH.
 |---|---|
 | `ws bootstrap` | Runs `clone`, `link`, then `doctor`. Safe to repeat. `./bootstrap.sh` is the same thing |
 | `ws sync [--no-self]` | Pulls the workspace repo and restarts itself, then `clone`, `pull`, `link`, `status`. `--no-self` skips the workspace pull |
-| `ws doctor` | Checks git, where the workspace lives, the manifest, `.gitignore`, `CLAUDE.md`, every repo, and the links. Exits 1 only on a failure, not on warnings |
+| `ws doctor` | Checks git, where the workspace lives, the manifest, `.gitignore`, `CLAUDE.md` and its repo index, every repo and its path, and the links. Exits 1 only on a failure, not on warnings |
 
 ### Repos
 
 | Command | Behavior |
 |---|---|
 | `ws list [--tag T]` | Table of name, state (`cloned` or `missing`), tags and path |
-| `ws add NAME URL [--tags a,b] [--desc "text"] [--path DIR] [--no-clone]` | Validates the name, writes the manifest, regenerates the `CLAUDE.md` index, clones. Fails if the name exists |
+| `ws add NAME URL [--tags a,b] [--desc "text"] [--path repos/DIR] [--no-clone]` | Validates the name and path, writes the manifest, regenerates the `CLAUDE.md` index, clones. Fails if the name exists, or if `--path` is not a relative path under `repos/`. If the clone fails, the manifest entry is removed again, so nothing is left half-added |
 | `ws remove NAME` | Deletes the manifest section and regenerates the index. Leaves the clone on disk |
 | `ws clone [--tag T] [NAME...]` | Clones missing repos. Skips ones already cloned. Refuses a non-empty directory that is not a git repo |
 | `ws path NAME` | Prints the absolute path. Exits 1 for an unknown name |
 | `ws index` | Rewrites the block between `<!-- ws:repos:start -->` and `<!-- ws:repos:end -->` in `CLAUDE.md` |
+| `ws index --check` | Changes nothing. Exits 1 when that block no longer matches `repos.conf` |
 
 ### Across repos
 
 | Command | Behavior |
 |---|---|
-| `ws status [--tag T]` | One row per repo, plus the workspace repo: branch, changed-file count, ahead and behind counts. Ends with totals |
+| `ws status [--tag T]` | One row per repo, plus the workspace repo: branch, changed-file count, ahead and behind counts. Under a row, a `+` line for each other local branch with commits that are on no remote, for stashes, and for each linked worktree with uncommitted changes. Ends with totals. Reads local refs only: it does not fetch |
 | `ws pull [--tag T]` | `git pull --ff-only` in each repo that is cloned, clean and has an upstream. Reports and skips the rest |
 | `ws grep [--tag T] [GIT-GREP-OPTIONS] PATTERN` | `git grep -n -I` in each cloned repo, with paths prefixed by the repo's location. Tracked files only. Exits 1 when nothing matches |
 | `ws exec [--tag T] -- COMMAND [ARGS...]` | Runs the command inside each cloned repo. Exits 1 if any run failed |
@@ -91,7 +92,8 @@ The portability rules are in the comment at the top of `bin/ws`. In short:
 - Options that take a value call `need_val` first.
 
 To add a command: write `cmd_<name>`, add it to the `case` in `main` and to
-`cmd_help`, add checks to `tests/smoke.sh`, and document it here.
+`cmd_help`, add checks to `tests/smoke.sh`, and document it here. The smoke
+test fails when a command in `ws help` is missing from this file.
 
 ## Testing
 
@@ -104,5 +106,5 @@ The test builds local bare repos to act as remotes, simulates two machines,
 and exercises every command. It uses no network and never touches the real
 `~/.claude` or real repos.
 
-Test status when this was written: all checks pass on Linux with bash 5.2 and
-git 2.43. Not yet run on macOS. That is pilot check P1.
+Where the test has been run, and with which versions, is recorded under P1 in
+`08-pilot-checklist.md`. Run it again after changing `ws`.
