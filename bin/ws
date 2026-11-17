@@ -1,0 +1,827 @@
+#!/usr/bin/env bash
+#
+# ws - helper for a multi-repo workspace (meta repo).
+#
+# The workspace is one git repo that manages many independent project repos.
+# The list of project repos lives in repos.conf (git-config format) and is
+# parsed with git itself, so this script needs only bash and git.
+#
+# Portability rules for anyone (human or agent) editing this file:
+#   - Must run on macOS's stock bash 3.2 and on Linux bash 4/5.
+#   - No associative arrays, mapfile/readarray, ${var,,}, or `local -n`.
+#   - No GNU-only flags: no `readlink -f`, `sed -i`, `realpath`, `grep -P`.
+#   - With `set -u`, never expand a possibly-empty array as "${a[@]}".
+#   - Everything is inside functions and the last line calls main, so the
+#     file is fully parsed before it runs. `ws sync` can then update this
+#     script with git pull without breaking the running process.
+#
+# See docs/09-ws-reference.md for the command reference.
+
+set -u
+
+# ---------------------------------------------------------------- setup ----
+
+resolve_root() {
+  # Follow symlinks so `ws` still finds the workspace when it is linked
+  # into a directory on PATH.
+  local src="$1" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  (cd -P "$(dirname "$src")/.." && pwd)
+}
+
+ROOT="$(resolve_root "${BASH_SOURCE[0]}")"
+MANIFEST="$ROOT/repos.conf"
+LOCAL_CONF="$ROOT/.ws.local"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+SHARED_SKILLS="$ROOT/shared/skills"
+SHARED_AGENTS="$ROOT/shared/agents"
+INDEX_FILE="$ROOT/CLAUDE.md"
+INDEX_START='<!-- ws:repos:start -->'
+INDEX_END='<!-- ws:repos:end -->'
+
+if [ -t 1 ]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+  C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=''; C_GRN=''; C_YEL=''; C_DIM=''; C_BLD=''; C_OFF=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${C_DIM}$*${C_OFF}"; }
+ok()   { printf '%s\n' "${C_GRN}ok${C_OFF}    $*"; }
+warn() { printf '%s\n' "${C_YEL}warn${C_OFF}  $*" >&2; }
+err()  { printf '%s\n' "${C_RED}error${C_OFF} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# Guard for options that take a value: `shift 2` on a single remaining
+# argument fails without shifting and would loop forever.
+need_val() {
+  [ "$1" -ge 2 ] || die "option $2 needs a value"
+}
+
+need_git() {
+  command -v git >/dev/null 2>&1 || die "git is not installed. Install git first."
+}
+
+# ------------------------------------------------------------- manifest ----
+
+cfg() { git config -f "$MANIFEST" "$@"; }
+
+valid_name() {
+  # Letters, digits, hyphen, underscore. No dots or spaces: the name is
+  # used as a git-config subsection and as a directory name.
+  case "$1" in
+    ''|-*|*[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+repo_names() {
+  [ -f "$MANIFEST" ] || return 0
+  cfg --name-only --get-regexp '^repo\..*\.url$' 2>/dev/null \
+    | sed -e 's/^repo\.//' -e 's/\.url$//'
+}
+
+repo_exists() { cfg --get "repo.$1.url" >/dev/null 2>&1; }
+
+repo_get() { cfg --get "repo.$1.$2" 2>/dev/null || true; }
+
+repo_rel() {
+  local p
+  p="$(repo_get "$1" path)"
+  [ -n "$p" ] || p="repos/$1"
+  say "$p"
+}
+
+repo_path() {
+  local p
+  p="$(repo_rel "$1")"
+  case "$p" in
+    /*) say "$p" ;;
+    *) say "$ROOT/$p" ;;
+  esac
+}
+
+is_cloned() { [ -e "$(repo_path "$1")/.git" ]; }
+
+has_tag() {
+  local tags
+  tags="$(repo_get "$1" tags | tr -d ' ')"
+  case ",$tags," in
+    *",$2,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+check_names() {
+  local name
+  for name in "$@"; do
+    repo_exists "$name" || die "unknown repo: $name (see: ws list)"
+  done
+}
+
+# select_repos TAG [NAME...]
+# Prints the repo names to act on: the given names, or every repo in the
+# manifest, filtered by TAG when TAG is not empty.
+select_repos() {
+  local tag="$1" name
+  shift
+  if [ $# -gt 0 ]; then
+    for name in "$@"; do say "$name"; done
+    return 0
+  fi
+  for name in $(repo_names); do
+    if [ -z "$tag" ] || has_tag "$name" "$tag"; then
+      say "$name"
+    fi
+  done
+}
+
+# ------------------------------------------------------------- commands ----
+
+cmd_list() {
+  local tag="" name state count=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      *) die "list: unknown argument: $1" ;;
+    esac
+  done
+  printf "${C_BLD}%-20s %-8s %-22s %s${C_OFF}\n" "REPO" "STATE" "TAGS" "PATH"
+  for name in $(select_repos "$tag"); do
+    if is_cloned "$name"; then state="cloned"; else state="missing"; fi
+    printf '%-20s %-8s %-22s %s\n' \
+      "$name" "$state" "$(repo_get "$name" tags)" "$(repo_rel "$name")"
+    count=$((count + 1))
+  done
+  if [ "$count" -eq 0 ]; then
+    info "No repos in $(basename "$MANIFEST") yet. Add one: ws add <name> <git-url>"
+  fi
+}
+
+cmd_path() {
+  [ $# -eq 1 ] || die "usage: ws path <name>"
+  repo_exists "$1" || die "unknown repo: $1"
+  repo_path "$1"
+}
+
+cmd_clone() {
+  local tag="" name url p failed=0
+  local names=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      -*) die "clone: unknown option: $1" ;;
+      *) names="$names $1"; shift ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  check_names $names
+  # shellcheck disable=SC2086
+  for name in $(select_repos "$tag" $names); do
+    url="$(repo_get "$name" url)"
+    p="$(repo_path "$name")"
+    if is_cloned "$name"; then
+      info "skip  $name (already cloned)"
+    elif [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
+      warn "$name: $p exists and is not a git repo; leaving it alone"
+      failed=$((failed + 1))
+    else
+      say "${C_BLD}clone${C_OFF} $name <- $url"
+      mkdir -p "$(dirname "$p")"
+      if git clone "$url" "$p"; then
+        ok "$name"
+      else
+        err "$name: clone failed"
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+  [ "$failed" -eq 0 ]
+}
+
+cmd_add() {
+  local name="" url="" tags="" path="" desc="" do_clone=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tags) need_val $# "$1"; tags="$2"; shift 2 ;;
+      --path) need_val $# "$1"; path="$2"; shift 2 ;;
+      --desc) need_val $# "$1"; desc="$2"; shift 2 ;;
+      --no-clone) do_clone=0; shift ;;
+      -*) die "add: unknown option: $1" ;;
+      *)
+        if [ -z "$name" ]; then name="$1"
+        elif [ -z "$url" ]; then url="$1"
+        else die "add: unexpected argument: $1"
+        fi
+        shift ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$url" ] \
+    || die "usage: ws add <name> <git-url> [--tags a,b] [--desc \"text\"] [--path dir] [--no-clone]"
+  valid_name "$name" \
+    || die "invalid name '$name': use letters, digits, '-' and '_' only"
+  repo_exists "$name" && die "repo '$name' is already in $(basename "$MANIFEST")"
+
+  cfg "repo.$name.url" "$url" || die "could not write $(basename "$MANIFEST")"
+  [ -z "$path" ] || cfg "repo.$name.path" "$path"
+  [ -z "$tags" ] || cfg "repo.$name.tags" "$tags"
+  [ -z "$desc" ] || cfg "repo.$name.desc" "$desc"
+  ok "added $name to $(basename "$MANIFEST")"
+
+  cmd_index
+  if [ "$do_clone" -eq 1 ]; then
+    cmd_clone "$name" || return 1
+  fi
+  info "Commit the manifest change: git -C \"$ROOT\" add repos.conf CLAUDE.md && git -C \"$ROOT\" commit -m \"Add $name\""
+}
+
+cmd_remove() {
+  [ $# -eq 1 ] || die "usage: ws remove <name>"
+  repo_exists "$1" || die "unknown repo: $1"
+  local p
+  p="$(repo_path "$1")"
+  cfg --remove-section "repo.$1" || die "could not update $(basename "$MANIFEST")"
+  ok "removed $1 from $(basename "$MANIFEST")"
+  cmd_index
+  if [ -e "$p" ]; then
+    info "The clone at $p was left in place. Delete it yourself if you no longer need it."
+  fi
+}
+
+# Rewrite the repo index block in CLAUDE.md from repos.conf, so agents see
+# the list of repos without running a command and the two never drift.
+cmd_index() {
+  local block tmp name desc tags line
+  [ -f "$INDEX_FILE" ] || { warn "no CLAUDE.md at workspace root; skipping index"; return 0; }
+  if ! grep -qF "$INDEX_START" "$INDEX_FILE" || ! grep -qF "$INDEX_END" "$INDEX_FILE"; then
+    warn "CLAUDE.md has no '$INDEX_START' / '$INDEX_END' markers; skipping index"
+    return 0
+  fi
+  block="$ROOT/.ws-index.tmp"
+  tmp="$ROOT/.ws-claude.tmp"
+  : > "$block"
+  for name in $(repo_names); do
+    desc="$(repo_get "$name" desc)"
+    tags="$(repo_get "$name" tags)"
+    line="- **$name** (\`$(repo_rel "$name")\`)"
+    [ -z "$desc" ] || line="$line: $desc"
+    [ -z "$tags" ] || line="$line _[${tags}]_"
+    printf '%s\n' "$line" >> "$block"
+  done
+  [ -s "$block" ] || printf '%s\n' "_No repos yet. Add one with \`ws add <name> <git-url>\`._" > "$block"
+
+  awk -v start="$INDEX_START" -v end="$INDEX_END" -v block="$block" '
+    index($0, start) {
+      print
+      while ((getline line < block) > 0) print line
+      close(block)
+      skipping = 1
+      next
+    }
+    index($0, end) { skipping = 0 }
+    !skipping { print }
+  ' "$INDEX_FILE" > "$tmp" && cat "$tmp" > "$INDEX_FILE"
+  rm -f "$block" "$tmp"
+  info "repo index in CLAUDE.md is up to date"
+}
+
+# One status row. Args: label, path
+status_row() {
+  local label="$1" p="$2" branch dirty sync counts behind ahead
+  if [ ! -e "$p/.git" ]; then
+    printf '%-20s %s\n' "$label" "${C_YEL}missing${C_OFF} (run: ws clone $label)"
+    N_MISSING=$((N_MISSING + 1))
+    return 0
+  fi
+  branch="$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null)"
+  [ -n "$branch" ] || branch="(detached)"
+  dirty="$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  counts="$(git -C "$p" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null)"
+  if [ -z "$counts" ]; then
+    sync="no upstream"
+    N_UNPUSHED=$((N_UNPUSHED + 1))
+  else
+    # shellcheck disable=SC2086
+    set -- $counts
+    behind="$1"; ahead="$2"
+    if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then
+      sync="in sync"
+    else
+      sync="ahead $ahead, behind $behind"
+    fi
+    [ "$ahead" -eq 0 ] || N_UNPUSHED=$((N_UNPUSHED + 1))
+  fi
+  [ "$dirty" -eq 0 ] || N_DIRTY=$((N_DIRTY + 1))
+  if [ "$dirty" -eq 0 ]; then dirty="clean"; else dirty="$dirty changed"; fi
+  printf '%-20s %-22s %-12s %s\n' "$label" "$branch" "$dirty" "$sync"
+}
+
+cmd_status() {
+  local tag="" name total=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      *) die "status: unknown argument: $1" ;;
+    esac
+  done
+  N_MISSING=0; N_DIRTY=0; N_UNPUSHED=0
+  printf "${C_BLD}%-20s %-22s %-12s %s${C_OFF}\n" "REPO" "BRANCH" "WORKTREE" "REMOTE"
+  if [ -e "$ROOT/.git" ]; then
+    status_row "(workspace)" "$ROOT"
+  else
+    printf '%-20s %s\n' "(workspace)" "${C_YEL}not a git repo yet${C_OFF} (run: git init)"
+  fi
+  for name in $(select_repos "$tag"); do
+    status_row "$name" "$(repo_path "$name")"
+    total=$((total + 1))
+  done
+  say ""
+  say "$total project repo(s). Counting the workspace repo too: $N_DIRTY with uncommitted changes, $N_UNPUSHED with unpushed commits or no upstream, $N_MISSING not cloned"
+  if [ $((N_DIRTY + N_UNPUSHED)) -gt 0 ]; then
+    info "Work that is not pushed will not be on your other machines."
+  fi
+}
+
+cmd_pull() {
+  local tag="" name p failed=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      *) die "pull: unknown argument: $1" ;;
+    esac
+  done
+  for name in $(select_repos "$tag"); do
+    p="$(repo_path "$name")"
+    if ! is_cloned "$name"; then
+      info "skip  $name (not cloned)"
+    elif [ -n "$(git -C "$p" status --porcelain 2>/dev/null)" ]; then
+      warn "$name: has uncommitted changes, not pulling"
+    elif ! git -C "$p" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+      info "skip  $name (current branch has no upstream)"
+    elif git -C "$p" pull --ff-only --quiet; then
+      ok "$name"
+    else
+      err "$name: pull failed (branches diverged?)"
+      failed=$((failed + 1))
+    fi
+  done
+  [ "$failed" -eq 0 ]
+}
+
+cmd_exec() {
+  local tag="" name p rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "usage: ws exec [--tag t] -- <command> [args...]"
+  for name in $(select_repos "$tag"); do
+    is_cloned "$name" || continue
+    p="$(repo_path "$name")"
+    say "${C_BLD}== $name${C_OFF}"
+    (cd "$p" && "$@") || rc=1
+  done
+  return "$rc"
+}
+
+# Search every cloned repo with git grep. A plain search from the workspace
+# root skips repos/ because it is gitignored there; this does not.
+cmd_grep() {
+  local tag="" name p rel out found=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tag) need_val $# "$1"; tag="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "usage: ws grep [--tag t] [git-grep options] <pattern>"
+  for name in $(select_repos "$tag"); do
+    is_cloned "$name" || continue
+    p="$(repo_path "$name")"
+    rel="$(repo_rel "$name")"
+    out="$(git -C "$p" --no-pager grep -n -I "$@")"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed "s|^|$rel/|"
+      found=0
+    fi
+  done
+  return "$found"
+}
+
+# ------------------------------------------------------- link / unlink ----
+
+link_mode() {
+  local m=""
+  [ -f "$LOCAL_CONF" ] && m="$(git config -f "$LOCAL_CONF" --get link.mode 2>/dev/null || true)"
+  [ -n "$m" ] || m="symlink"
+  say "$m"
+}
+
+managed_file() { say "$CLAUDE_DIR/.ws-managed"; }
+
+is_managed() {
+  local f
+  f="$(managed_file)"
+  [ -f "$f" ] && grep -qxF "$1" "$f"
+}
+
+managed_add() {
+  is_managed "$1" || printf '%s\n' "$1" >> "$(managed_file)"
+}
+
+managed_del() {
+  local f
+  f="$(managed_file)"
+  [ -f "$f" ] || return 0
+  grep -vxF "$1" "$f" > "$f.tmp" || true
+  cat "$f.tmp" > "$f"
+  rm -f "$f.tmp"
+}
+
+# link_one SRC DEST MODE
+link_one() {
+  local src="$1" dest="$2" mode="$3" cur
+  if [ -L "$dest" ]; then
+    cur="$(readlink "$dest")"
+    if [ "$cur" = "$src" ] && [ "$mode" = "symlink" ]; then
+      info "ok    $dest"
+      return 0
+    fi
+    case "$cur" in
+      "$ROOT"/*) rm -f "$dest" ;;   # ours, stale or switching mode
+      *)
+        if [ ! -e "$dest" ]; then
+          rm -f "$dest"             # dangling, e.g. the workspace was moved
+        else
+          warn "$dest is a symlink to $cur (not this workspace); leaving it alone"
+          return 1
+        fi ;;
+    esac
+  elif [ -e "$dest" ]; then
+    if is_managed "$dest"; then
+      rm -rf "$dest"
+    else
+      warn "$dest already exists and was not created by ws; leaving it alone"
+      return 1
+    fi
+  fi
+  if [ "$mode" = "copy" ]; then
+    cp -R "$src" "$dest" && managed_add "$dest" && ok "copied $dest"
+  else
+    managed_del "$dest"
+    ln -s "$src" "$dest" && ok "linked $dest"
+  fi
+}
+
+# Remove links or copies whose source no longer exists in shared/.
+# Args: dest dir under ~/.claude, matching source dir under shared/
+prune_dir() {
+  local dest_dir="$1" src_dir="$2" entry cur f
+  [ -d "$dest_dir" ] || return 0
+  for entry in "$dest_dir"/*; do
+    [ -L "$entry" ] || continue
+    cur="$(readlink "$entry")"
+    case "$cur" in
+      "$ROOT"/shared/*)
+        if [ ! -e "$cur" ]; then
+          rm -f "$entry"
+          info "pruned $entry (source was removed)"
+        fi ;;
+    esac
+  done
+  f="$(managed_file)"
+  [ -f "$f" ] || return 0
+  while IFS= read -r entry; do
+    case "$entry" in
+      "$dest_dir"/*)
+        if [ ! -e "$src_dir/$(basename "$entry")" ]; then
+          rm -rf "$entry"
+          managed_del "$entry"
+          info "pruned $entry (source was removed)"
+        fi ;;
+    esac
+  done < "$f.snapshot"
+}
+
+cmd_link() {
+  local mode item name problems=0 f
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --copy)
+        git config -f "$LOCAL_CONF" link.mode copy; shift ;;
+      --symlink)
+        git config -f "$LOCAL_CONF" link.mode symlink; shift ;;
+      *) die "link: unknown argument: $1" ;;
+    esac
+  done
+  mode="$(link_mode)"
+  mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/agents"
+  say "${C_BLD}link${C_OFF}  shared skills and agents -> $CLAUDE_DIR ($mode mode)"
+
+  # Skills are directories that contain SKILL.md.
+  for item in "$SHARED_SKILLS"/*; do
+    [ -f "$item/SKILL.md" ] || continue
+    name="$(basename "$item")"
+    link_one "$item" "$CLAUDE_DIR/skills/$name" "$mode" || problems=$((problems + 1))
+  done
+  # Agents are single markdown files. README.md is documentation, not an agent.
+  for item in "$SHARED_AGENTS"/*.md; do
+    [ -f "$item" ] || continue
+    name="$(basename "$item")"
+    [ "$name" = "README.md" ] && continue
+    link_one "$item" "$CLAUDE_DIR/agents/$name" "$mode" || problems=$((problems + 1))
+  done
+
+  f="$(managed_file)"
+  if [ -f "$f" ]; then cp "$f" "$f.snapshot"; else : > "$f.snapshot"; fi
+  prune_dir "$CLAUDE_DIR/skills" "$SHARED_SKILLS"
+  prune_dir "$CLAUDE_DIR/agents" "$SHARED_AGENTS"
+  rm -f "$f.snapshot"
+  [ -s "$f" ] || rm -f "$f"
+
+  if [ "$problems" -gt 0 ]; then
+    warn "$problems item(s) were not linked because something else is already there"
+    return 1
+  fi
+}
+
+cmd_unlink() {
+  local dir entry cur f
+  for dir in "$CLAUDE_DIR/skills" "$CLAUDE_DIR/agents"; do
+    [ -d "$dir" ] || continue
+    for entry in "$dir"/*; do
+      [ -L "$entry" ] || continue
+      cur="$(readlink "$entry")"
+      case "$cur" in
+        "$ROOT"/shared/*) rm -f "$entry"; ok "removed $entry" ;;
+      esac
+    done
+  done
+  f="$(managed_file)"
+  if [ -f "$f" ]; then
+    while IFS= read -r entry; do
+      case "$entry" in
+        "$CLAUDE_DIR"/skills/*|"$CLAUDE_DIR"/agents/*)
+          rm -rf "$entry"; ok "removed $entry" ;;
+      esac
+    done < "$f"
+    rm -f "$f"
+  fi
+}
+
+# --------------------------------------------------------------- doctor ----
+
+cmd_doctor() {
+  local fails=0 warns=0 name p url actual lines n item dest parent dir f hits both_setting=0
+  d_ok()   { ok "$*"; }
+  d_warn() { warn "$*"; warns=$((warns + 1)); }
+  d_fail() { err "$*"; fails=$((fails + 1)); }
+
+  say "${C_BLD}Workspace${C_OFF} $ROOT"
+  d_ok "git $(git --version | sed 's/^git version //')"
+
+  if [ -e "$ROOT/.git" ]; then
+    if [ -n "$(git -C "$ROOT" remote 2>/dev/null)" ]; then
+      d_ok "workspace is a git repo with a remote"
+    else
+      d_warn "workspace repo has no remote, so it cannot sync to other machines yet"
+    fi
+    if git -C "$ROOT" check-ignore -q repos/x 2>/dev/null; then
+      d_ok "repos/ is ignored by the workspace repo"
+    else
+      d_fail "repos/ is NOT ignored by the workspace repo; check .gitignore"
+    fi
+  else
+    d_warn "workspace is not a git repo yet (run: git init && git add -A && git commit -m init)"
+  fi
+
+  # Where the workspace lives. See docs/02-architecture.md.
+  parent="$(dirname "$ROOT")"
+  if git -C "$parent" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    d_warn "the workspace is inside another git repo ($(git -C "$parent" rev-parse --show-toplevel)). Move it out of that repo"
+  fi
+  dir="$parent"
+  while :; do
+    for f in CLAUDE.md CLAUDE.local.md; do
+      if [ -f "$dir/$f" ]; then
+        d_warn "$dir/$f is above the workspace, so it also loads into every session here"
+      fi
+    done
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  case "$ROOT" in
+    *Dropbox*|*"Mobile Documents"*|*CloudStorage*|*OneDrive*|*"Google Drive"*|*[Ss]yncthing*)
+      d_warn "the workspace path looks like a cloud-synced folder. File sync tools and git conflict; keep the workspace outside it" ;;
+  esac
+
+  if [ -f "$MANIFEST" ]; then
+    n="$(repo_names | wc -l | tr -d ' ')"
+    d_ok "repos.conf parses, $n repo(s)"
+  else
+    d_fail "repos.conf is missing"
+  fi
+
+  if [ -f "$INDEX_FILE" ]; then
+    lines="$(wc -l < "$INDEX_FILE" | tr -d ' ')"
+    if [ "$lines" -gt 150 ]; then
+      d_warn "CLAUDE.md is $lines lines. It loads into every session in every repo; keep it short"
+    else
+      d_ok "CLAUDE.md present ($lines lines)"
+    fi
+    # An @import here resolves outside the working directory when Claude
+    # starts inside a child repo, which triggers an approval dialog per repo.
+    if sed -e '/^```/,/^```/d' "$INDEX_FILE" | grep -Eq '(^|[[:space:]])@[A-Za-z0-9_~./-]+\.(md|txt)'; then
+      d_warn "CLAUDE.md contains an @import. From a child repo that is an external import and needs approval in each repo. Use a plain path in backticks instead"
+    fi
+  else
+    d_fail "CLAUDE.md is missing at the workspace root"
+  fi
+
+  # A hardcoded home directory breaks on a machine with another user name.
+  hits="$(grep -rnE '(/Users/|/home/)[A-Za-z0-9._-]+/' \
+    "$ROOT/CLAUDE.md" "$ROOT/AGENTS.md" "$ROOT/shared" 2>/dev/null | head -5)"
+  if [ -n "$hits" ]; then
+    d_warn "absolute home paths found in shared files. Use ~ or \$HOME so they work for any user name:"
+    printf '%s\n' "$hits" | sed "s|^$ROOT/|        |" >&2
+  fi
+
+  say ""
+  say "${C_BLD}Repos${C_OFF}"
+  if [ -f "$CLAUDE_DIR/settings.json" ] \
+    && grep -q 'claude-md-and-agents-md' "$CLAUDE_DIR/settings.json" 2>/dev/null; then
+    both_setting=1
+  fi
+  for name in $(repo_names); do
+    p="$(repo_path "$name")"
+    if ! valid_name "$name"; then
+      d_fail "$name: invalid name in repos.conf (letters, digits, '-', '_' only)"
+      continue
+    fi
+    if ! is_cloned "$name"; then
+      d_warn "$name: not cloned (run: ws clone $name)"
+      continue
+    fi
+    url="$(repo_get "$name" url)"
+    actual="$(git -C "$p" remote get-url origin 2>/dev/null || true)"
+    if [ "$actual" != "$url" ]; then
+      d_warn "$name: origin is '$actual' but repos.conf says '$url'"
+    else
+      d_ok "$name"
+    fi
+    if [ -f "$p/AGENTS.md" ] && [ ! -f "$p/CLAUDE.md" ] \
+      && [ ! -f "$p/.claude/CLAUDE.md" ] && [ ! -f "$p/CLAUDE.local.md" ] \
+      && [ "$both_setting" -eq 0 ]; then
+      d_warn "$name: has AGENTS.md but no CLAUDE.md. Claude Code skips AGENTS.md when a CLAUDE.md exists above it, and the workspace CLAUDE.md does. See docs/03-context-loading.md"
+    fi
+  done
+  [ -n "$(repo_names)" ] || info "(none yet)"
+
+  say ""
+  say "${C_BLD}Shared skills and agents${C_OFF} -> $CLAUDE_DIR ($(link_mode) mode)"
+  for item in "$SHARED_SKILLS"/*; do
+    [ -f "$item/SKILL.md" ] || continue
+    dest="$CLAUDE_DIR/skills/$(basename "$item")"
+    if [ -e "$dest" ]; then d_ok "skill $(basename "$item")"
+    else d_warn "skill $(basename "$item") is not linked (run: ws link)"; fi
+  done
+  for item in "$SHARED_AGENTS"/*.md; do
+    [ -f "$item" ] || continue
+    [ "$(basename "$item")" = "README.md" ] && continue
+    dest="$CLAUDE_DIR/agents/$(basename "$item")"
+    if [ -e "$dest" ]; then d_ok "agent $(basename "$item" .md)"
+    else d_warn "agent $(basename "$item" .md) is not linked (run: ws link)"; fi
+  done
+
+  say ""
+  if command -v claude >/dev/null 2>&1; then
+    d_ok "claude is on PATH"
+  else
+    d_warn "claude is not on PATH on this machine"
+  fi
+  case ":$PATH:" in
+    *":$ROOT/bin:"*) d_ok "ws is on PATH" ;;
+    *) info "tip   add ws to PATH: export PATH=\"$ROOT/bin:\$PATH\"" ;;
+  esac
+
+  say ""
+  say "$fails failure(s), $warns warning(s)"
+  [ "$fails" -eq 0 ]
+}
+
+# ---------------------------------------------------- bootstrap / sync ----
+
+cmd_bootstrap() {
+  local rc=0
+  say "${C_BLD}Bootstrapping workspace${C_OFF} $ROOT"
+  say ""
+  cmd_clone || rc=1
+  say ""
+  cmd_link || rc=1
+  say ""
+  cmd_doctor || rc=1
+  return "$rc"
+}
+
+cmd_sync() {
+  local self=1 rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-self) self=0; shift ;;
+      *) die "sync: unknown argument: $1" ;;
+    esac
+  done
+  if [ "$self" -eq 1 ] && [ -e "$ROOT/.git" ] \
+    && git -C "$ROOT" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    say "${C_BLD}pull${C_OFF}  workspace"
+    if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+      warn "workspace has uncommitted changes, not pulling it"
+    else
+      git -C "$ROOT" pull --ff-only --quiet || warn "workspace pull failed"
+    fi
+    # The pull may have changed this script or repos.conf. Start over
+    # with the new version.
+    exec "$ROOT/bin/ws" sync --no-self
+  fi
+  cmd_clone || rc=1
+  say ""
+  cmd_pull || rc=1
+  say ""
+  cmd_link || rc=1
+  say ""
+  cmd_status
+  return "$rc"
+}
+
+cmd_help() {
+  cat <<'EOF'
+ws - manage a multi-repo workspace
+
+Setup
+  ws bootstrap                 Clone missing repos, link shared skills/agents, run doctor
+  ws sync                      Pull the workspace, clone missing repos, pull all, relink
+  ws doctor                    Check that this machine is set up correctly
+
+Repos (the list lives in repos.conf)
+  ws list [--tag t]            Show repos, tags and whether each is cloned
+  ws add <name> <url> [--tags a,b] [--desc "text"] [--path dir] [--no-clone]
+  ws remove <name>             Remove from repos.conf (the clone stays on disk)
+  ws clone [--tag t] [name..]  Clone repos that are missing
+  ws path <name>               Print the absolute path of a repo
+  ws index                     Rewrite the repo list inside CLAUDE.md from repos.conf
+
+Across repos
+  ws status [--tag t]          Branch, uncommitted changes and unpushed commits per repo
+  ws pull [--tag t]            Fast-forward every clean repo
+  ws grep [--tag t] <pattern>  Search all repos (accepts git grep options)
+  ws exec [--tag t] -- <cmd>   Run a command inside every repo
+
+Shared skills and agents
+  ws link [--copy|--symlink]   Install shared/skills and shared/agents into ~/.claude
+  ws unlink                    Remove what ws link installed
+
+Environment
+  CLAUDE_CONFIG_DIR            Claude Code config directory (default: ~/.claude)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    help|-h|--help) cmd_help; return 0 ;;
+  esac
+  need_git
+  case "$cmd" in
+    bootstrap) cmd_bootstrap "$@" ;;
+    sync)      cmd_sync "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    list|ls)   cmd_list "$@" ;;
+    add)       cmd_add "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    clone)     cmd_clone "$@" ;;
+    path)      cmd_path "$@" ;;
+    index)     cmd_index "$@" ;;
+    status|st) cmd_status "$@" ;;
+    pull)      cmd_pull "$@" ;;
+    grep)      cmd_grep "$@" ;;
+    exec)      cmd_exec "$@" ;;
+    link)      cmd_link "$@" ;;
+    unlink)    cmd_unlink "$@" ;;
+    *) err "unknown command: $cmd"; say ""; cmd_help; return 2 ;;
+  esac
+}
+
+main "$@"
+exit $?

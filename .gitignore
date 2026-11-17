@@ -1,0 +1,16 @@
+# Project repos are independent git repos. The workspace repo tracks the list
+# of them (repos.conf), never their contents.
+/repos/*
+!/repos/.gitkeep
+
+# Per-machine state
+.ws.local
+.ws-*.tmp
+CLAUDE.local.md
+.claude/settings.local.json
+.env
+.env.*
+
+# OS and editor noise
+.DS_Store
+*.swp
