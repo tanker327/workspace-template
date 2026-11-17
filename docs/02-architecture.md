@@ -7,6 +7,7 @@ workspace/
 ├── CLAUDE.md             Shared instructions. Loaded by every session at or below here
 ├── AGENTS.md             Pointer to CLAUDE.md for tools that look for AGENTS.md
 ├── README.md             Human quick start
+├── LICENSE               MIT
 ├── repos.conf            Manifest: the list of project repos
 ├── bootstrap.sh          Wrapper for `ws bootstrap`
 ├── bin/

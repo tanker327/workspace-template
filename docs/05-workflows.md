@@ -5,20 +5,21 @@ by path.
 
 ## W1. First setup, on the first machine
 
+Start from your own private copy of the template. `README.md` says how to make
+one. Keep it private: `repos.conf` and `CLAUDE.md` will list your repos.
+
 Choose the directory first. Any location works except the ones listed under
 "Where the workspace directory can live" in `02-architecture.md`.
 
 ```bash
+git clone <private-workspace-url> ~/path/to/workspace
 cd ~/path/to/workspace
-git init && git add -A && git commit -m "Workspace skeleton"
 export PATH="$PWD/bin:$PATH"      # also add to ~/.zshrc or ~/.bashrc
 
 ws add <name> <git-url> --tags <a,b> --desc "<one line>"   # repeat per repo
 ./bootstrap.sh
 
-git add -A && git commit -m "Add first repos"
-git remote add origin <private-workspace-url>
-git push -u origin main
+git add -A && git commit -m "Add first repos" && git push
 ```
 
 Then run `tests/smoke.sh` once on this OS and work through
